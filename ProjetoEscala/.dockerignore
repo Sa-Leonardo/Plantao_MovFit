@@ -1,0 +1,43 @@
+# Módulos Node — serão instalados no container
+**/node_modules
+**/.pnp
+**/.pnp.js
+
+# Build outputs locais
+frontend/dist
+backend/dist
+
+# Dados (nunca entram na imagem)
+data
+*.db
+*.db-wal
+*.db-shm
+
+# Ambiente
+.env
+.env.*
+!.env.example
+
+# Controle de versão
+.git
+.gitignore
+
+# Editor/IDE
+.vscode
+.idea
+*.swp
+*.swo
+.DS_Store
+
+# Logs
+*.log
+npm-debug.log*
+
+# Dockerfile / compose de dev não precisam ir pra imagem
+docker-compose*.yml
+Dockerfile
+.dockerignore
+README.md
+INSTRUCOES.md
+PLANO_MELHORIAS.md
+escala-suporte.jsx
