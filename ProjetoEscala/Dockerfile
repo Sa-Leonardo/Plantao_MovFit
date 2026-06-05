@@ -1,39 +1,43 @@
 # ============================================================
-# Stage 1 — Build do frontend (React/Vite)
+# Stage 1 - Frontend build (React/Vite)
 # ============================================================
 FROM node:20-alpine AS frontend-builder
 
 WORKDIR /build
 COPY frontend/package*.json ./
-RUN npm install
+RUN npm ci
 
 COPY frontend/ ./
 RUN npm run build
-# Resultado: /build/dist/index.html + /build/dist/assets/*
 
 # ============================================================
-# Stage 2 — Backend Node + arquivos estáticos do frontend
+# Stage 2 - Backend Node + static frontend files
 # ============================================================
 FROM node:20-alpine
 
 WORKDIR /app
 
-# Dependências nativas + timezone data
+# Native build deps for better-sqlite3 plus timezone data.
 RUN apk add --no-cache python3 make g++ tzdata
+
 ENV TZ=America/Sao_Paulo
+ENV NODE_ENV=production
+ENV PORT=3001
+ENV DB_PATH=/data/escala.db
+ENV PUBLIC_DIR=/app/public
 
-# Instala deps do backend (só production)
+# Backend production dependencies.
 COPY backend/package*.json ./
-RUN npm install --production
+RUN npm ci --omit=dev
 
-# Copia código do backend
+# Backend source.
 COPY backend/src ./src
 
-# Copia o build do frontend para ser servido pelo Express
+# Frontend build served by Express.
 COPY --from=frontend-builder /build/dist ./public
 
-# Data directory (será montado como volume em runtime)
-RUN mkdir -p /app/data
+# Railway persistent volume should be mounted here.
+RUN mkdir -p /data
 
 EXPOSE 3001
 

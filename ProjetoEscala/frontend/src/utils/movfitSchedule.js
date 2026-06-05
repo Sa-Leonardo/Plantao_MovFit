@@ -31,7 +31,7 @@ export const MOVFIT_EMPLOYEES = [
   { name: 'Alohana', regular_start: '09:30', regular_end: '15:45' },
   { name: 'Maria', regular_start: '10:00', regular_end: '16:15' },
   { name: 'Lara', regular_start: '11:00', regular_end: '17:15' },
-  { name: 'Pablo', regular_start: '14:00', regular_end: '00:00' },
+  { name: 'Pablo', regular_start: '14:00', regular_end: '00:00', regular_segments: [['14:00', '18:00'], ['20:00', '00:00']] },
   { name: 'Celline', regular_start: '15:45', regular_end: '22:00' },
   { name: 'Raissa', regular_start: '17:00', regular_end: '23:15' },
 ];
@@ -56,6 +56,33 @@ function absoluteMinutes(dateStr, time, isEnd = false) {
   let mins = minutes(time);
   if (isEnd && time === '00:00') mins += 24 * 60;
   return base + mins;
+}
+
+function addDays(dateStr, days) {
+  const date = parseDateStr(dateStr);
+  date.setDate(date.getDate() + days);
+  return dStr(date);
+}
+
+function isRegularWorkday(dateStr) {
+  const dow = parseDateStr(dateStr).getDay();
+  return dow >= 1 && dow <= 5;
+}
+
+function regularSegments(employee) {
+  return employee.regular_segments || [[employee.regular_start, employee.regular_end]];
+}
+
+function regularWindow(employee, dateStr, edge, offDates = new Set()) {
+  if (offDates.has(dateStr)) return null;
+  if (!isRegularWorkday(dateStr)) return null;
+  const segments = regularSegments(employee);
+  if (edge === 'start') {
+    const [start] = segments[0];
+    return absoluteMinutes(dateStr, start);
+  }
+  const [, end] = segments[segments.length - 1];
+  return absoluteMinutes(dateStr, end, true);
 }
 
 function dateType(dateStr, holidayMap) {
@@ -142,15 +169,26 @@ function affinityPenalty(employee, shift) {
   return Math.abs(regular - slot) / 60;
 }
 
-function isRestValid(employeeId, dateStr, shift, stats, dayAssignedIds) {
+function isRestValid(employee, dateStr, shift, stats, dayAssignedIds, offDates = new Set()) {
+  const employeeId = employee.id;
   if (dayAssignedIds.has(employeeId)) return false;
-  const last = stats[employeeId].lastAssignment;
-  if (!last) return true;
-  if (last.date === dateStr) return false;
   const start = absoluteMinutes(dateStr, shift.start_time);
-  const restHours = (start - last.endAbs) / 60;
-  if (restHours < 11) return false;
-  if (last.slot === 'F4' && shift.code === 'F1') return false;
+  const end = absoluteMinutes(dateStr, shift.end_time, true);
+
+  const last = stats[employeeId].lastAssignment;
+  if (last) {
+    if (last.date === dateStr) return false;
+    const restHours = (start - last.endAbs) / 60;
+    if (restHours < 11) return false;
+    if (last.slot === 'F4' && shift.code === 'F1') return false;
+  }
+
+  const previousRegularEnd = regularWindow(employee, addDays(dateStr, -1), 'end', offDates);
+  if (previousRegularEnd != null && (start - previousRegularEnd) / 60 < 11) return false;
+
+  const nextRegularStart = regularWindow(employee, addDays(dateStr, 1), 'start', offDates);
+  if (nextRegularStart != null && (nextRegularStart - end) / 60 < 11) return false;
+
   return true;
 }
 
@@ -158,14 +196,39 @@ export function generateMovfitAnnualSchedule({ year = MOVFIT_YEAR, team = [], sh
   const ctx = buildMovfitContext(team, shifts, holidays);
   const schedule = {};
   const events = getMovfitEvents(year, ctx.holidays);
+  const offDates = new Set(events.map(e => e.date));
   const stats = initStats(ctx.employees);
   const nameToId = new Map(ctx.employees.map(e => [e.name.toLowerCase(), e.id]));
   seedInitialHistory(stats, nameToId);
 
   const assignmentsByDate = new Map();
 
-  for (const event of events) {
-    const previousDay = dStr(new Date(parseDateStr(event.date).setDate(parseDateStr(event.date).getDate() - 1)));
+  for (let eventIndex = 0; eventIndex < events.length; eventIndex++) {
+    const event = events[eventIndex];
+    const nextEvent = events[eventIndex + 1];
+    const isSaturdayEvent = parseDateStr(event.date).getDay() === 6;
+    const isPlainWeekendPair = isSaturdayEvent &&
+      nextEvent?.date === addDays(event.date, 1) &&
+      parseDateStr(nextEvent.date).getDay() === 0 &&
+      !overrides[event.date] &&
+      !overrides[nextEvent.date] &&
+      ctx.employees.length >= 8;
+
+    if (isPlainWeekendPair) {
+      const paired = buildWeekendPair(event, nextEvent, ctx.employees, ctx.shifts, stats, assignmentsByDate, offDates);
+      if (paired) {
+        schedule[event.date] = paired.saturday.assignment;
+        schedule[nextEvent.date] = paired.sunday.assignment;
+        applyAssignmentToStats(stats, event, ctx.shifts, paired.saturday.assignment);
+        applyAssignmentToStats(stats, nextEvent, ctx.shifts, paired.sunday.assignment);
+        assignmentsByDate.set(event.date, assignedIdsFromDay(paired.saturday.assignment));
+        assignmentsByDate.set(nextEvent.date, assignedIdsFromDay(paired.sunday.assignment));
+        eventIndex++;
+        continue;
+      }
+    }
+
+    const previousDay = addDays(event.date, -1);
     const prevIds = new Set(assignmentsByDate.get(previousDay) || []);
     const isSundayEvent = parseDateStr(event.date).getDay() === 0;
     const eventPool = ctx.employees
@@ -180,13 +243,20 @@ export function generateMovfitAnnualSchedule({ year = MOVFIT_YEAR, team = [], sh
       .slice(0, 4);
     const dayAssignedIds = new Set();
     const day = {};
+    const shiftsForEvent = isSundayEvent
+      ? [
+          ...ctx.shifts.filter(s => s.code === 'F4'),
+          ...ctx.shifts.filter(s => s.code === 'F3'),
+          ...ctx.shifts.filter(s => !['F4', 'F3'].includes(s.code)),
+        ]
+      : ctx.shifts;
 
-    for (const shift of ctx.shifts) {
+    for (const shift of shiftsForEvent) {
       const overrideIds = normalizeOverrideMembers(overrides[event.date]?.[shift.id]);
       const chosen = overrideIds[0] || (() => {
         const pool = eventPool.length === 4 ? eventPool : ctx.employees;
         let candidates = pool
-          .filter(e => isRestValid(e.id, event.date, shift, stats, dayAssignedIds))
+          .filter(e => isRestValid(e, event.date, shift, stats, dayAssignedIds, offDates))
           .map(e => ({
             employee: e,
             affinity: affinityPenalty(e, shift),
@@ -194,7 +264,7 @@ export function generateMovfitAnnualSchedule({ year = MOVFIT_YEAR, team = [], sh
         if (candidates.length === 0) {
           candidates = ctx.employees
             .filter(e => !isSundayEvent || !prevIds.has(e.id))
-            .filter(e => isRestValid(e.id, event.date, shift, stats, dayAssignedIds))
+            .filter(e => isRestValid(e, event.date, shift, stats, dayAssignedIds, offDates))
             .map(e => ({ employee: e, affinity: affinityPenalty(e, shift) }));
         }
         candidates.sort((a, b) => {
@@ -211,11 +281,7 @@ export function generateMovfitAnnualSchedule({ year = MOVFIT_YEAR, team = [], sh
 
       day[shift.id] = chosen ? [chosen] : [];
       if (chosen && stats[chosen]) {
-        const endAbs = absoluteMinutes(event.date, shift.end_time, true);
-        stats[chosen].total += 1;
-        stats[chosen][event.type] += 1;
-        stats[chosen][shift.code] += 1;
-        stats[chosen].lastAssignment = { date: event.date, slot: shift.code, endAbs };
+        applyOneAssignmentToStats(stats, chosen, event, shift);
         dayAssignedIds.add(chosen);
       }
     }
@@ -224,9 +290,146 @@ export function generateMovfitAnnualSchedule({ year = MOVFIT_YEAR, team = [], sh
     schedule[event.date] = day;
   }
 
+  repairWeekendCoverage(schedule, events, ctx.shifts, ctx.employees);
   repairSlotBalance(schedule, events, ctx.shifts, ctx.employees);
   const displayStats = recomputeScheduleStats(schedule, events, ctx.shifts, ctx.employees);
   return { schedule, events, stats: displayStats, shifts: ctx.shifts, employees: ctx.employees, holidays: ctx.holidays };
+}
+
+function assignedIdsFromDay(day) {
+  return Object.values(day).flatMap(value => normalizeOverrideMembers(value));
+}
+
+function cloneStats(stats) {
+  const out = {};
+  for (const [id, value] of Object.entries(stats)) {
+    out[id] = { ...value, lastAssignment: value.lastAssignment ? { ...value.lastAssignment } : null };
+  }
+  return out;
+}
+
+function applyOneAssignmentToStats(stats, memberId, event, shift) {
+  const endAbs = absoluteMinutes(event.date, shift.end_time, true);
+  stats[memberId].total += 1;
+  stats[memberId][event.type] += 1;
+  stats[memberId][shift.code] += 1;
+  stats[memberId].lastAssignment = { date: event.date, slot: shift.code, endAbs };
+}
+
+function applyAssignmentToStats(stats, event, shifts, assignment) {
+  for (const shift of shifts) {
+    for (const id of normalizeOverrideMembers(assignment[shift.id])) {
+      if (stats[id]) applyOneAssignmentToStats(stats, id, event, shift);
+    }
+  }
+}
+
+function assignmentScore(event, shifts, assignment, employeesById, stats) {
+  let score = 0;
+  for (const shift of shifts) {
+    const id = normalizeOverrideMembers(assignment[shift.id])[0];
+    const employee = employeesById[id];
+    if (!employee) continue;
+    const s = stats[id];
+    score += (s[shift.code] * 10) + (s[event.type] * 8) + (s.total * 4) + affinityPenalty(employee, shift);
+  }
+  return score;
+}
+
+function buildDayOptions(event, employees, shiftsOrder, stats, prevIds, offDates, forcedEmployees = null) {
+  const employeesById = Object.fromEntries(employees.map(e => [e.id, e]));
+  const pool = forcedEmployees || employees;
+  const isSundayEvent = parseDateStr(event.date).getDay() === 0;
+  const options = [];
+
+  const walk = (shiftIdx, assignment, assignedIds) => {
+    if (shiftIdx >= shiftsOrder.length) {
+      options.push({
+        assignment,
+        score: assignmentScore(event, shiftsOrder, assignment, employeesById, stats),
+      });
+      return;
+    }
+
+    const shift = shiftsOrder[shiftIdx];
+    const candidates = pool
+      .filter(e => !assignedIds.has(e.id))
+      .filter(e => !isSundayEvent || !prevIds.has(e.id))
+      .filter(e => isRestValid(e, event.date, shift, stats, assignedIds, offDates))
+      .map(e => ({ employee: e, affinity: affinityPenalty(e, shift) }))
+      .sort((a, b) => {
+        const as = stats[a.employee.id];
+        const bs = stats[b.employee.id];
+        return (as[shift.code] - bs[shift.code]) ||
+          (as[event.type] - bs[event.type]) ||
+          (as.total - bs.total) ||
+          (a.affinity - b.affinity) ||
+          a.employee.name.localeCompare(b.employee.name);
+      });
+
+    for (const candidate of candidates) {
+      walk(
+        shiftIdx + 1,
+        { ...assignment, [shift.id]: [candidate.employee.id] },
+        new Set([...assignedIds, candidate.employee.id])
+      );
+    }
+  };
+
+  walk(0, {}, new Set());
+  return options.sort((a, b) => a.score - b.score);
+}
+
+function buildWeekendPair(saturday, sunday, employees, shifts, stats, assignmentsByDate, offDates) {
+  const previousDay = addDays(saturday.date, -1);
+  const prevIds = new Set(assignmentsByDate.get(previousDay) || []);
+  const employeesById = Object.fromEntries(employees.map(e => [e.id, e]));
+  const saturdayOptions = buildDayOptions(saturday, employees, shifts, stats, prevIds, offDates);
+  const sundayOrder = [
+    ...shifts.filter(s => s.code === 'F4'),
+    ...shifts.filter(s => s.code === 'F3'),
+    ...shifts.filter(s => !['F4', 'F3'].includes(s.code)),
+  ];
+
+  let best = null;
+  for (const saturdayOption of saturdayOptions) {
+    const saturdayIds = new Set(assignedIdsFromDay(saturdayOption.assignment));
+    const sundayEmployees = employees.filter(e => !saturdayIds.has(e.id));
+    if (sundayEmployees.length < 4) continue;
+
+    const statsAfterSaturday = cloneStats(stats);
+    applyAssignmentToStats(statsAfterSaturday, saturday, shifts, saturdayOption.assignment);
+    const sundayOptions = buildDayOptions(sunday, sundayEmployees, sundayOrder, statsAfterSaturday, saturdayIds, offDates).slice(0, 10);
+    if (sundayOptions.length === 0) continue;
+
+    const sundayOption = sundayOptions[0];
+    const score = saturdayOption.score + sundayOption.score +
+      assignedIdsFromDay(saturdayOption.assignment).reduce((sum, id) => sum + (stats[id]?.Sabado || 0), 0) +
+      assignedIdsFromDay(sundayOption.assignment).reduce((sum, id) => sum + (statsAfterSaturday[id]?.Domingo || 0), 0);
+
+    if (!best || score < best.score) {
+      best = {
+        score,
+        saturday: saturdayOption,
+        sunday: {
+          ...sundayOption,
+          assignment: Object.fromEntries(shifts.map(shift => [shift.id, sundayOption.assignment[shift.id] || []])),
+        },
+      };
+    }
+  }
+
+  if (!best) return null;
+  best.saturday.assignment = Object.fromEntries(shifts.map(shift => [shift.id, best.saturday.assignment[shift.id] || []]));
+  best.sunday.assignment = Object.fromEntries(shifts.map(shift => [shift.id, best.sunday.assignment[shift.id] || []]));
+
+  const critical = validateMovfitSchedule({
+    schedule: { [saturday.date]: best.saturday.assignment, [sunday.date]: best.sunday.assignment },
+    events: [saturday, sunday],
+    shifts,
+    employees: Object.values(employeesById),
+  }).alerts.some(a => a.level === 'critical');
+  return critical ? null : best;
 }
 
 function recomputeScheduleStats(schedule, events, shifts, employees) {
@@ -285,11 +488,54 @@ function repairSlotBalance(schedule, events, shifts, employees) {
   }
 }
 
+function repairWeekendCoverage(schedule, events, shifts, employees) {
+  const eventByDate = Object.fromEntries(events.map(event => [event.date, event]));
+  for (const event of events) {
+    if (parseDateStr(event.date).getDay() !== 0) continue;
+    const sunday = schedule[event.date];
+    if (!sunday) continue;
+    const missingShift = shifts.find(shift => normalizeOverrideMembers(sunday[shift.id]).length !== 1);
+    if (!missingShift) continue;
+
+    const saturdayDate = addDays(event.date, -1);
+    const saturdayEvent = eventByDate[saturdayDate];
+    const saturday = schedule[saturdayDate];
+    if (!saturdayEvent || !saturday) continue;
+
+    const assigned = new Set([
+      ...assignedIdsFromDay(saturday),
+      ...assignedIdsFromDay(sunday),
+    ]);
+    const unassignedEmployees = employees.filter(employee => !assigned.has(employee.id));
+    let repaired = false;
+    for (const satShift of shifts) {
+      const saturdayWorker = normalizeOverrideMembers(saturday[satShift.id])[0];
+      if (!saturdayWorker) continue;
+
+      for (const replacement of unassignedEmployees) {
+        saturday[satShift.id] = [replacement.id];
+        sunday[missingShift.id] = [saturdayWorker];
+
+        const critical = validateMovfitSchedule({ schedule, events, shifts, employees }).alerts.some(a => a.level === 'critical');
+        if (!critical) {
+          repaired = true;
+          break;
+        }
+
+        saturday[satShift.id] = [saturdayWorker];
+        sunday[missingShift.id] = [];
+      }
+      if (repaired) break;
+    }
+  }
+}
+
 export function validateMovfitSchedule({ schedule, events, shifts, employees }) {
   const alerts = [];
   const shiftById = Object.fromEntries(shifts.map(s => [s.id, s]));
   const byEmployee = {};
   const totals = initStats(employees);
+  const offDates = new Set(events.map(e => e.date));
 
   for (const event of events) {
     const day = schedule[event.date] || {};
@@ -315,6 +561,24 @@ export function validateMovfitSchedule({ schedule, events, shifts, employees }) 
 
   for (const employee of employees) {
     const list = (byEmployee[employee.id] || []).sort((a, b) => a.date.localeCompare(b.date) || a.shift.start_time.localeCompare(b.shift.start_time));
+    for (const item of list) {
+      const start = absoluteMinutes(item.date, item.shift.start_time);
+      const end = absoluteMinutes(item.date, item.shift.end_time, true);
+      const previousRegularEnd = regularWindow(employee, addDays(item.date, -1), 'end', offDates);
+      if (previousRegularEnd != null) {
+        const rest = (start - previousRegularEnd) / 60;
+        if (rest < 11) {
+          alerts.push({ level: 'critical', date: item.date, employee: employee.name, message: `Descanso apos expediente regular inferior a 11h (${rest.toFixed(1)}h)` });
+        }
+      }
+      const nextRegularStart = regularWindow(employee, addDays(item.date, 1), 'start', offDates);
+      if (nextRegularStart != null) {
+        const rest = (nextRegularStart - end) / 60;
+        if (rest < 11) {
+          alerts.push({ level: 'critical', date: item.date, employee: employee.name, message: `Descanso antes do expediente regular inferior a 11h (${rest.toFixed(1)}h)` });
+        }
+      }
+    }
     for (let i = 1; i < list.length; i++) {
       const prev = list[i - 1];
       const curr = list[i];
